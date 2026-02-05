@@ -7,6 +7,7 @@ import os
 import struct
 from collections import namedtuple
 from io import BytesIO
+import re
 
 # --- 数据结构 ---
 GlyphProps = namedtuple("GlyphProps", ["width", "height", "advance_x", "left", "top", "data_length", "data_offset", "code_point"])
@@ -68,23 +69,31 @@ if "intervals" not in st.session_state:
 uploaded_fonts = st.file_uploader(
     "📁 上传字体文件（支持 .ttf / .otf / .ttc，可多选）",
     type=["ttf", "otf", "ttc"],
-    accept_multiple_files=True
+    accept_multiple_files=False
 )
 
 # 自动设置默认字体名称（取第一个文件名，不含扩展名）
 default_name = "MyFont"
-if uploaded_fonts:
-    first_file = uploaded_fonts[0].name
+if uploaded_fonts is not None:
+    first_file = uploaded_fonts.name
+    # 去掉扩展名
     if "." in first_file:
-        default_name = first_file.rsplit(".", 1)[0]
+        base_name = first_file.rsplit(".", 1)[0]
     else:
-        default_name = first_file
+        base_name = first_file
+    # 仅保留中文和英文字母
+    cleaned = re.sub(r'[^\u4e00-\u9fffA-Za-z]', '', base_name)
+    # 如果清洗后为空，回退到默认名
+    default_name = cleaned if cleaned else "MyFont"
 
 col1, col2 = st.columns(2)
 with col1:
-    name = st.text_input("字体名称（用于生成文件名）", value=default_name, help="默认为上传的第一个字体文件名（不含扩展名）")
     size = st.number_input("字号（像素）", min_value=8, max_value=256, value=24, step=1)
+    default_name= f"{default_name}{size}"
+    name = st.text_input("字体名称（用于生成文件名）", value=default_name, help="默认为上传的第一个字体文件名（不含扩展名）")
+    
     is2bit = st.checkbox("生成 2-bit 灰度字体（默认为 1-bit 黑白）")
+    
 
 # --- 额外 Unicode 区间 ---
 st.subheader("🔤 额外 Unicode 区间（可选）")
@@ -127,16 +136,19 @@ if st.button("🚀 开始生成字体", type="primary", use_container_width=True
     else:
         try:
             # 1. 加载字体到内存（使用临时文件）
-            font_stack = []
-            temp_paths = []
+            if uploaded_fonts is None:
+                st.error("❌ 请上传一个字体文件！")
+                st.stop()
 
-            for uf in uploaded_fonts:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".ttf") as tmp:
-                    tmp.write(uf.getvalue())
-                    tmp_path = tmp.name
-                    temp_paths.append(tmp_path)
-                face = freetype.Face(tmp_path)
-                font_stack.append(face)
+            # 只处理这一个文件
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".ttf") as tmp:
+                tmp.write(uploaded_fonts.getvalue())  # ← 直接用 uploaded_fonts，不是 uf
+                tmp_path = tmp.name
+
+            face = freetype.Face(tmp_path)
+            temp_paths = [tmp_path]  # 仍用列表方便后面统一清理
+            font_stack = [face]
+            # 注意：不再有 font_stack，只有一个 face
 
             # 2. 合并区间
             intervals = DEFAULT_INTERVALS + st.session_state.intervals
