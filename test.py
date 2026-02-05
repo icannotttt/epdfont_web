@@ -57,9 +57,9 @@ def _load_glyph(code_point, font_stack):
     return None
 
 # --- Streamlit App ---
-st.set_page_config(page_title="EPDiy 字体转换工具（网页版）", layout="wide")
-st.title("🖨️ EPDiy 字体转换工具（支持中文 & 多字体）")
-st.caption("将 TTF/OTF 字体转换为 EPDiy 可用的 .epdfont 文件（仅二进制格式）")
+st.set_page_config(page_title="crosspoint字体转换工具（网页版）", layout="wide")
+st.title("🖨️ EPDiy 字体转换工具")
+st.caption("将 TTF/OTF 字体转换为 crosspoint 可用的 .epdfont 文件")
 
 # 初始化 session state
 if "intervals" not in st.session_state:
@@ -67,7 +67,7 @@ if "intervals" not in st.session_state:
 
 # --- UI 输入 ---
 uploaded_fonts = st.file_uploader(
-    "📁 上传字体文件（支持 .ttf / .otf / .ttc，可多选）",
+    "📁 上传字体文件（支持 .ttf / .otf / .ttc，仅单选）",
     type=["ttf", "otf", "ttc"],
     accept_multiple_files=False
 )
@@ -348,4 +348,4 @@ if st.button("🚀 开始生成字体", type="primary", use_container_width=True
             st.exception(e)
 
 st.markdown("---")
-st.caption("© 2026 基于 EPDiy 字体工具改造 | 仅输出 .epdfont 二进制格式")
+st.caption("© 2026 基于 crosspoint 字体工具改造 | 仅输出 .epdfont 二进制格式")
