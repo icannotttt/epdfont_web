@@ -8,6 +8,7 @@ import struct
 from collections import namedtuple
 from io import BytesIO
 import re
+from PIL import Image, ImageOps
 
 # --- 数据结构 ---
 GlyphProps = namedtuple("GlyphProps", ["width", "height", "advance_x", "left", "top", "data_length", "data_offset", "code_point"])
@@ -56,21 +57,181 @@ def _load_glyph(code_point, font_stack):
             return face
     return None
 
+def _set_face_size_by_visual_height(face, target_px):
+    target_px = max(1, int(target_px))
+    effective_px = target_px
+    probe_code_points = [ord("中"), ord("M"), ord("A"), ord("0"), ord("|")]
+
+    for _ in range(4):
+        face.set_pixel_sizes(0, effective_px)
+
+        measured_height = 0
+        for cp in probe_code_points:
+            glyph_index = face.get_char_index(cp)
+            if glyph_index > 0:
+                face.load_glyph(glyph_index, freetype.FT_LOAD_RENDER)
+                measured_height = int(face.glyph.bitmap.rows)
+                if measured_height > 0:
+                    break
+
+        if measured_height <= 0:
+            return
+        if abs(measured_height - target_px) <= 1:
+            return
+
+        next_effective = max(1, int(round(effective_px * target_px / measured_height)))
+        if next_effective == effective_px:
+            return
+        effective_px = next_effective
+
+    face.set_pixel_sizes(0, effective_px)
+
+def _get_glyph_with_fallback(cp, font_stack):
+    face = _load_glyph(cp, font_stack)
+    if face is not None:
+        return face
+    return _load_glyph(ord('?'), font_stack)
+
+def _layout_text_like_epd(text, font_stack, ascender, advance_y, width, height):
+    placements = []
+    min_x = 0
+    min_y = 0
+    max_x = 0
+    max_y = 0
+
+    cursor_x = 0
+    y_top = 0
+
+    def move_to_next_line():
+        nonlocal cursor_x, y_top
+        cursor_x = 0
+        y_top += int(advance_y)
+
+    for ch in text:
+        if ch == "\n":
+            move_to_next_line()
+            if y_top >= height:
+                break
+            continue
+
+        face = _get_glyph_with_fallback(ord(ch), font_stack)
+        if face is None:
+            continue
+
+        glyph = face.glyph
+        bitmap = glyph.bitmap
+        advance_x = norm_round(glyph.advance.x)
+        glyph_left = cursor_x + glyph.bitmap_left
+        glyph_right = glyph_left + bitmap.width
+
+        if cursor_x > 0 and glyph_right > width:
+            move_to_next_line()
+            if y_top >= height:
+                break
+            glyph_left = cursor_x + glyph.bitmap_left
+            glyph_right = glyph_left + bitmap.width
+
+        baseline_y = y_top + int(ascender)
+        glyph_top = baseline_y - glyph.bitmap_top
+        if glyph_top >= height:
+            break
+
+        placements.append({
+            "cursor_x": cursor_x,
+            "baseline_y": baseline_y,
+            "left": glyph.bitmap_left,
+            "top": glyph.bitmap_top,
+            "width": bitmap.width,
+            "rows": bitmap.rows,
+            "pitch": abs(bitmap.pitch),
+            "buffer": bytes(bitmap.buffer),
+        })
+        min_x = min(min_x, glyph_left)
+        max_x = max(max_x, glyph_right)
+        min_y = min(min_y, baseline_y + glyph.bitmap_top - bitmap.rows)
+        max_y = max(max_y, baseline_y + glyph.bitmap_top)
+        cursor_x += advance_x
+
+    return placements, max_x - min_x, max_y - min_y
+
+def _calc_text_bounds_like_epd(text, font_stack, ascender, advance_y, width, height):
+    _, text_w, text_h = _layout_text_like_epd(text, font_stack, ascender, advance_y, width, height)
+    return text_w, text_h
+
+def _render_preview_like_device(text, font_stack, ascender, advance_y, is2bit, width=480, height=800):
+    placements, _, _ = _layout_text_like_epd(text, font_stack, ascender, advance_y, width, height)
+    min_x = 0
+    image = Image.new("L", (width, height), 255)
+    pixels = image.load()
+
+    for placement in placements:
+        left = placement["left"]
+        top = placement["top"]
+        pitch = placement["pitch"]
+        cursor_x = placement["cursor_x"]
+        baseline_y = placement["baseline_y"]
+        glyph_width = placement["width"]
+        glyph_rows = placement["rows"]
+        glyph_buffer = placement["buffer"]
+
+        for gy in range(glyph_rows):
+            row_start = gy * pitch
+            for gx in range(glyph_width):
+                coverage = glyph_buffer[row_start + gx]
+                draw_on = False
+
+                if is2bit:
+                    level4 = coverage >> 4
+                    draw_on = level4 >= 4
+                else:
+                    draw_on = coverage > 0
+
+                if not draw_on:
+                    continue
+
+                sx = cursor_x + left + gx
+                sy = baseline_y - top + gy
+                if 0 <= sx < width and 0 <= sy < height:
+                    pixels[sx, sy] = 0
+
+    return image
+
 # --- Streamlit App ---
 st.set_page_config(page_title="crosspoint字体转换工具（网页版）", layout="wide")
-st.title("🖨️ EPDiy 字体转换工具")
-st.caption("将 TTF/OTF 字体转换为 crosspoint 可用的 .epdfont 文件")
+st.title("crosspoint 字体转换工具（网页版）")
+st.caption("将 TTF字体转换为 crosspoint 可用的 .epdfont 文件")
 
 # 初始化 session state
 if "intervals" not in st.session_state:
     st.session_state.intervals = []
+if "show_preview" not in st.session_state:
+    st.session_state.show_preview = False
 
 # --- UI 输入 ---
 uploaded_fonts = st.file_uploader(
-    "📁 上传字体文件（支持 .ttf / .otf / .ttc，仅单选）",
-    type=["ttf", "otf", "ttc"],
+    "📁 上传字体文件（支持 .ttf ，仅单选）",
+    type=["ttf"],
     accept_multiple_files=False
 )
+
+font_loaded_ok = False
+font_load_err = ""
+if uploaded_fonts is not None:
+    temp_validate_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ttf") as tmp_font:
+            tmp_font.write(uploaded_fonts.getvalue())
+            temp_validate_path = tmp_font.name
+        freetype.Face(temp_validate_path)
+        font_loaded_ok = True
+    except Exception as ex:
+        font_load_err = str(ex)
+    finally:
+        if temp_validate_path and os.path.exists(temp_validate_path):
+            try:
+                os.unlink(temp_validate_path)
+            except:
+                pass
 
 # 自动设置默认字体名称（取第一个文件名，不含扩展名）
 default_name = "MyFont"
@@ -88,11 +249,65 @@ if uploaded_fonts is not None:
 
 col1, col2 = st.columns(2)
 with col1:
-    size = st.number_input("字号（像素）", min_value=8, max_value=256, value=24, step=1)
+    size = st.number_input("字号", min_value=8, max_value=256, value=24, step=1)
     default_name= f"{default_name}{size}"
     name = st.text_input("字体名称（用于生成文件名）", value=default_name, help="默认为上传的第一个字体文件名（不含扩展名）")
     
-    is2bit = st.checkbox("生成 2-bit 灰度字体（默认为 1-bit 黑白）")
+    is2bit = st.checkbox("生成 2-bit 灰度字体（默认开启）", value=True)
+
+if uploaded_fonts is not None:
+    if font_loaded_ok:
+        st.success("✅ 字体读取成功")
+    else:
+        st.error(f"❌ 字体读取失败: {font_load_err}")
+
+preview_text = st.text_area(
+    "预览文本",
+    value="海客谈瀛洲，烟涛微茫信难求。\n越人语天姥，云霞明灭或可睹。\n天姥连天向天横，势拔五岳掩赤城。\n天台四万八千丈，对此欲倒东南倾。\n我欲因之梦吴越，一夜飞度镜湖月。\n湖月照我影，送我至剡溪。\n谢公宿处今尚在，渌水荡漾清猿啼。",
+    height=180
+)
+    
+if font_loaded_ok and st.button("预览大小（仅参考）", use_container_width=True):
+    st.session_state.show_preview = True
+
+if st.session_state.show_preview and uploaded_fonts is not None and font_loaded_ok:
+    tmp_preview_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ttf") as tmp_preview_font:
+            tmp_preview_font.write(uploaded_fonts.getvalue())
+            tmp_preview_path = tmp_preview_font.name
+
+        preview_face = freetype.Face(tmp_preview_path)
+        preview_stack = [preview_face]
+        preview_face.set_char_size(size << 6, size << 6, 150, 150)
+
+        ascender = norm_ceil(preview_face.size.ascender)
+        advance_y = max(1, norm_ceil(preview_face.size.height))
+
+        preview_image = _render_preview_like_device(
+            preview_text,
+            preview_stack,
+            ascender=ascender,
+            advance_y=advance_y,
+            is2bit=is2bit,
+            width=480,
+            height=800,
+        )
+        preview_with_border = ImageOps.expand(preview_image, border=3, fill=0)
+        text_w, text_h = _calc_text_bounds_like_epd(preview_text, preview_stack, ascender, advance_y, 480, 800)
+
+        st.image(preview_with_border, caption="实机近似预览", width=243)
+        st.caption(
+            f"预览度量：bbox={text_w}×{text_h}px | ascender={ascender}px | lineHeight(advanceY)={advance_y}px"
+        )
+    except Exception as preview_ex:
+        st.error(f"❌ 预览生成失败: {preview_ex}")
+    finally:
+        if tmp_preview_path and os.path.exists(tmp_preview_path):
+            try:
+                os.unlink(tmp_preview_path)
+            except:
+                pass
     
 
 # --- 额外 Unicode 区间 ---
