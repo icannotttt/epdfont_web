@@ -49,6 +49,64 @@ def chunks(l, n):
     for i in range(0, len(l), n):
         yield l[i:i + n]
 
+def _adjust_glyph_bitmap_horizontal(bitmap, side_spacing_px):
+    width = int(bitmap.width)
+    rows = int(bitmap.rows)
+    pitch = abs(int(bitmap.pitch))
+    crop = max(0, -int(side_spacing_px))
+    pad = max(0, int(side_spacing_px))
+
+    if rows <= 0:
+        new_width = max(0, width - crop * 2 + pad * 2)
+        return new_width, 0, b""
+
+    source_buffer = bytes(bitmap.buffer)
+    new_width = max(0, width - crop * 2 + pad * 2)
+    adjusted = bytearray()
+
+    for y in range(rows):
+        row_start = y * pitch
+        row = bytearray(source_buffer[row_start:row_start + width])
+
+        if crop > 0:
+            if width > crop * 2:
+                row = row[crop:width - crop]
+            else:
+                row = bytearray()
+
+        if pad > 0:
+            row = (bytearray([0] * pad)) + row + (bytearray([0] * pad))
+
+        if len(row) < new_width:
+            row.extend([0] * (new_width - len(row)))
+        elif len(row) > new_width:
+            row = row[:new_width]
+
+        adjusted.extend(row)
+
+    return new_width, rows, bytes(adjusted)
+
+def _pack_gray8_to_4bit(gray_buffer, width, rows):
+    if width <= 0 or rows <= 0:
+        return []
+
+    pixels4g = []
+    for y in range(rows):
+        px = 0
+        row_start = y * width
+        for x in range(width):
+            v = gray_buffer[row_start + x]
+            if x % 2 == 0:
+                px = (v >> 4)
+            else:
+                px = px | (v & 0xF0)
+                pixels4g.append(px)
+                px = 0
+            if x == width - 1 and width % 2 == 1:
+                pixels4g.append(px)
+                px = 0
+    return pixels4g
+
 def _load_glyph(code_point, font_stack):
     for face in font_stack:
         glyph_index = face.get_char_index(code_point)
@@ -92,7 +150,7 @@ def _get_glyph_with_fallback(cp, font_stack):
         return face
     return _load_glyph(ord('?'), font_stack)
 
-def _layout_text_like_epd(text, font_stack, ascender, advance_y, width, height):
+def _layout_text_like_epd(text, font_stack, ascender, advance_y, width, height, letter_spacing=0):
     placements = []
     min_x = 0
     min_y = 0
@@ -119,17 +177,19 @@ def _layout_text_like_epd(text, font_stack, ascender, advance_y, width, height):
             continue
 
         glyph = face.glyph
-        bitmap = glyph.bitmap
-        advance_x = norm_round(glyph.advance.x)
-        glyph_left = cursor_x + glyph.bitmap_left
-        glyph_right = glyph_left + bitmap.width
+        glyph_width, glyph_rows, glyph_buffer = _adjust_glyph_bitmap_horizontal(glyph.bitmap, letter_spacing)
+        advance_x = max(0, norm_round(glyph.advance.x) + letter_spacing * 2)
+        adjusted_left = glyph.bitmap_left - letter_spacing
+        glyph_left = cursor_x + adjusted_left
+        glyph_right = glyph_left + glyph_width
 
         if cursor_x > 0 and glyph_right > width:
             move_to_next_line()
             if y_top >= height:
                 break
             glyph_left = cursor_x + glyph.bitmap_left
-            glyph_right = glyph_left + bitmap.width
+            glyph_left = cursor_x + adjusted_left
+            glyph_right = glyph_left + glyph_width
 
         baseline_y = y_top + int(ascender)
         glyph_top = baseline_y - glyph.bitmap_top
@@ -139,27 +199,27 @@ def _layout_text_like_epd(text, font_stack, ascender, advance_y, width, height):
         placements.append({
             "cursor_x": cursor_x,
             "baseline_y": baseline_y,
-            "left": glyph.bitmap_left,
+            "left": adjusted_left,
             "top": glyph.bitmap_top,
-            "width": bitmap.width,
-            "rows": bitmap.rows,
-            "pitch": abs(bitmap.pitch),
-            "buffer": bytes(bitmap.buffer),
+            "width": glyph_width,
+            "rows": glyph_rows,
+            "pitch": glyph_width,
+            "buffer": glyph_buffer,
         })
         min_x = min(min_x, glyph_left)
         max_x = max(max_x, glyph_right)
-        min_y = min(min_y, baseline_y + glyph.bitmap_top - bitmap.rows)
+        min_y = min(min_y, baseline_y + glyph.bitmap_top - glyph_rows)
         max_y = max(max_y, baseline_y + glyph.bitmap_top)
         cursor_x += advance_x
 
     return placements, max_x - min_x, max_y - min_y
 
-def _calc_text_bounds_like_epd(text, font_stack, ascender, advance_y, width, height):
-    _, text_w, text_h = _layout_text_like_epd(text, font_stack, ascender, advance_y, width, height)
+def _calc_text_bounds_like_epd(text, font_stack, ascender, advance_y, width, height, letter_spacing=0):
+    _, text_w, text_h = _layout_text_like_epd(text, font_stack, ascender, advance_y, width, height, letter_spacing=letter_spacing)
     return text_w, text_h
 
-def _render_preview_like_device(text, font_stack, ascender, advance_y, is2bit, width=480, height=800):
-    placements, _, _ = _layout_text_like_epd(text, font_stack, ascender, advance_y, width, height)
+def _render_preview_like_device(text, font_stack, ascender, advance_y, is2bit, width=480, height=800, letter_spacing=0):
+    placements, _, _ = _layout_text_like_epd(text, font_stack, ascender, advance_y, width, height, letter_spacing=letter_spacing)
     min_x = 0
     image = Image.new("L", (width, height), 255)
     pixels = image.load()
@@ -249,7 +309,12 @@ if uploaded_fonts is not None:
 
 col1, col2 = st.columns(2)
 with col1:
-    size = st.number_input("字号", min_value=8, max_value=256, value=24, step=1)
+    size_col, spacing_col = st.columns(2)
+    with size_col:
+        size = st.number_input("字号", min_value=8, max_value=256, value=24, step=1)
+    with spacing_col:
+        letter_spacing = st.number_input("字距(px)", min_value=-10, max_value=10, value=0, step=1)
+
     default_name= f"{default_name}{size}"
     name = st.text_input("字体名称（用于生成文件名）", value=default_name, help="默认为上传的第一个字体文件名（不含扩展名）")
     
@@ -292,9 +357,18 @@ if st.session_state.show_preview and uploaded_fonts is not None and font_loaded_
             is2bit=is2bit,
             width=480,
             height=800,
+            letter_spacing=letter_spacing,
         )
         preview_with_border = ImageOps.expand(preview_image, border=3, fill=0)
-        text_w, text_h = _calc_text_bounds_like_epd(preview_text, preview_stack, ascender, advance_y, 480, 800)
+        text_w, text_h = _calc_text_bounds_like_epd(
+            preview_text,
+            preview_stack,
+            ascender,
+            advance_y,
+            480,
+            800,
+            letter_spacing=letter_spacing,
+        )
 
         st.image(preview_with_border, caption="实机近似预览", width=243)
         st.caption(
@@ -412,30 +486,19 @@ if st.button("🚀 开始生成字体", type="primary", use_container_width=True
                         continue
 
                     bitmap = face.glyph.bitmap
+                    glyph_width, glyph_rows, gray_buffer = _adjust_glyph_bitmap_horizontal(bitmap, letter_spacing)
 
                     # 构建 4-bit 灰度像素
-                    pixels4g = []
-                    px = 0
-                    for i, v in enumerate(bitmap.buffer):
-                        x = i % bitmap.width
-                        if x % 2 == 0:
-                            px = (v >> 4)
-                        else:
-                            px = px | (v & 0xF0)
-                            pixels4g.append(px)
-                            px = 0
-                        if x == bitmap.width - 1 and bitmap.width % 2 == 1:
-                            pixels4g.append(px)
-                            px = 0
+                    pixels4g = _pack_gray8_to_4bit(gray_buffer, glyph_width, glyph_rows)
 
                     if is2bit:
                         pixels2b = []
                         px = 0
-                        pitch = (bitmap.width + 1) // 2
-                        for y in range(bitmap.rows):
-                            for x in range(bitmap.width):
+                        pitch = (glyph_width + 1) // 2 if glyph_width > 0 else 0
+                        for y in range(glyph_rows):
+                            for x in range(glyph_width):
                                 px <<= 2
-                                bm = pixels4g[y * pitch + (x // 2)]
+                                bm = pixels4g[y * pitch + (x // 2)] if pitch > 0 else 0
                                 bm = (bm >> ((x % 2) * 4)) & 0xF
                                 if bm >= 12:
                                     px |= 3
@@ -443,38 +506,40 @@ if st.button("🚀 开始生成字体", type="primary", use_container_width=True
                                     px |= 2
                                 elif bm >= 4:
                                     px |= 1
-                                if (y * bitmap.width + x) % 4 == 3:
+                                if (y * glyph_width + x) % 4 == 3:
                                     pixels2b.append(px)
                                     px = 0
-                        if (bitmap.width * bitmap.rows) % 4 != 0:
-                            px <<= (4 - (bitmap.width * bitmap.rows) % 4) * 2
+                        if (glyph_width * glyph_rows) % 4 != 0:
+                            px <<= (4 - (glyph_width * glyph_rows) % 4) * 2
                             pixels2b.append(px)
                         pixels = pixels2b
                     else:
                         pixelsbw = []
                         px = 0
-                        pitch = (bitmap.width + 1) // 2
-                        for y in range(bitmap.rows):
-                            for x in range(bitmap.width):
+                        pitch = (glyph_width + 1) // 2 if glyph_width > 0 else 0
+                        for y in range(glyph_rows):
+                            for x in range(glyph_width):
                                 px <<= 1
-                                bm = pixels4g[y * pitch + (x // 2)]
+                                bm = pixels4g[y * pitch + (x // 2)] if pitch > 0 else 0
                                 is_black = ((x % 2 == 0 and (bm & 0xE) > 0) or
                                             (x % 2 == 1 and (bm & 0xE0) > 0))
                                 px |= 1 if is_black else 0
-                                if (y * bitmap.width + x) % 8 == 7:
+                                if (y * glyph_width + x) % 8 == 7:
                                     pixelsbw.append(px)
                                     px = 0
-                        if (bitmap.width * bitmap.rows) % 8 != 0:
-                            px <<= 8 - (bitmap.width * bitmap.rows) % 8
+                        if (glyph_width * glyph_rows) % 8 != 0:
+                            px <<= 8 - (glyph_width * glyph_rows) % 8
                             pixelsbw.append(px)
                         pixels = pixelsbw
 
                     packed = bytes(pixels)
+                    adjusted_left = face.glyph.bitmap_left - letter_spacing
+                    adjusted_advance_x = max(0, norm_round(face.glyph.advance.x) + letter_spacing * 2)
                     glyph = GlyphProps(
-                        width=bitmap.width,
-                        height=bitmap.rows,
-                        advance_x=norm_round(face.glyph.advance.x),
-                        left=face.glyph.bitmap_left,
+                        width=glyph_width,
+                        height=glyph_rows,
+                        advance_x=adjusted_advance_x,
+                        left=adjusted_left,
                         top=face.glyph.bitmap_top,
                         data_length=len(packed),
                         data_offset=total_size,
