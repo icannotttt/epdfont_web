@@ -258,13 +258,17 @@ char_mode = st.radio(
     ["常用5000字（推荐）", "常用7000字","所有字体（不推荐）"],
     horizontal=True
 )
+
+is_mode_5000 = "5000" in char_mode
+is_mode_7000 = "7000" in char_mode
+is_mode_common = is_mode_5000 or is_mode_7000
 # 布局
 col1, col2, col3, col4 = st.columns(4)
 with col1:
     # 这里只是显示，不影响最终文件名
     st.text_input("字体名称（自动读取）", value=font_filename_base, disabled=False)
 with col2:
-    size = st.number_input("字号", 8, 128, 18)
+    size = st.number_input("字号", 8, 128, 24)
 with col3:
     letter_spacing = st.number_input("字距", -10, 20, 0)
 with col4:
@@ -287,14 +291,14 @@ if uploaded and tmp_path:
 
 # --------------------------
 # 生成逻辑（原版1:1）
-if char_mode == "常用5000字":
+if is_mode_5000:
     loadtxt="常用五千.txt"
-elif char_mode == "常用7000字":
+elif is_mode_7000:
     loadtxt="常用七千.txt"
 # --------------------------
 if st.button("生成字体", type="primary", use_container_width=True) and uploaded:
     font_stack = [freetype.Face(tmp_path)]
-    if char_mode == "常用5000字" or char_mode == "常用7000字":
+    if is_mode_common:
 
         common = load_common_chars_from_txt(loadtxt)
 
