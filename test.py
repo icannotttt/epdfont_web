@@ -5,9 +5,11 @@ import math
 import tempfile
 import os
 import struct
+import base64
 from collections import namedtuple
 from io import BytesIO
 from PIL import Image, ImageOps
+import streamlit.components.v1 as components
 
 st.markdown("""
 <style>
@@ -132,6 +134,46 @@ def load_glyph(code_point, font_stack):
             return face
     return None
 
+def single_enclosing_interval(sorted_codes):
+    if not sorted_codes:
+        return []
+    return [(sorted_codes[0], sorted_codes[-1])]
+
+def rebuild_glyphs_for_intervals(glyphs, intervals):
+    glyph_props_by_code = {}
+    glyph_data_by_code = {}
+    for g, d in glyphs:
+        glyph_props_by_code[g.code_point] = g
+        glyph_data_by_code[g.code_point] = d
+
+    new_gp = []
+    data_chunks = []
+    data_offset = 0
+
+    for s, e in intervals:
+        for code in range(s, e + 1):
+            if code in glyph_props_by_code:
+                old = glyph_props_by_code[code]
+                d = glyph_data_by_code[code]
+                g = GlyphProps(
+                    old.width,
+                    old.height,
+                    old.advance_x,
+                    old.left,
+                    old.top,
+                    len(d),
+                    data_offset,
+                    code,
+                )
+                data_chunks.append(d)
+                data_offset += len(d)
+            else:
+                # Occupy code points inside merged gaps so interval -> glyph index remains valid.
+                g = GlyphProps(0, 0, 0, 0, 0, 0, 0, code)
+            new_gp.append(g)
+
+    return new_gp, b"".join(data_chunks)
+
 # ------------------------------------------------------------------------------
 # 读取字体内部名称
 # ------------------------------------------------------------------------------
@@ -213,7 +255,7 @@ if uploaded:
         tmp_path = f.name
 char_mode = st.radio(
     "字符集选择",
-    ["常用5000字", "常用7000字","原逻辑"],
+    ["常用5000字（推荐）", "常用7000字","所有字体（不推荐）"],
     horizontal=True
 )
 # 布局
@@ -229,7 +271,7 @@ with col4:
     is2Bit = st.checkbox("2-bit 灰度", True)
 
 # 预览文本
-preview_text = """海客谈瀛洲 烟涛微茫信难求
+preview_text = """曈海客谈瀛洲 烟涛微茫信难求
 越人语天姥 云霞明灭或可睹
 天姥连天向天横 势拔五岳掩赤城
 天台四万八千丈 对此欲倒东南倾
@@ -406,20 +448,20 @@ if st.button("生成字体", type="primary", use_container_width=True) and uploa
         prog.progress((i+1)/total)
         status.text(f"{i+1}/{total}")
 
-    gp = [g for g,_ in glyphs]
-    gd = b"".join([d for _,d in glyphs])
+    base_gp = [g for g,_ in glyphs]
+    sorted_c = sorted({x.code_point for x in base_gp})
+    out_intervals = single_enclosing_interval(sorted_c)
+    gp, gd = rebuild_glyphs_for_intervals(glyphs, out_intervals)
 
-    sorted_c = sorted({x.code_point for x in gp})
-    out_intervals = []
-    if sorted_c:
-        s = e = sorted_c[0]
-        for c in sorted_c[1:]:
-            if c == e+1:
-                e = c
-            else:
-                out_intervals.append((s,e))
-                s=e=c
-        out_intervals.append((s,e))
+    final_ram = len(out_intervals) * 12
+    slot_count = len(gp)
+    real_glyph_count = len(base_gp)
+    placeholder_count = max(0, slot_count - real_glyph_count)
+    glyph_table_bytes = slot_count * 13
+    st.caption(f"Interval内存估算: 当前={len(out_intervals)}段/{final_ram}B")
+    st.caption(
+        f"Glyph索引估算: 实际字形={real_glyph_count}, 总槽位={slot_count}, 占位={placeholder_count}, 索引区≈{glyph_table_bytes}B"
+    )
     
 
     ref = load_glyph(ord('|'), font_stack) or font_stack[0]
@@ -464,10 +506,33 @@ if st.button("生成字体", type="primary", use_container_width=True) and uploa
     # ==========================
     final_filename = f"{font_filename_base}{size}.epdfont"
 
-    st.download_button(
-        "下载字体",
-        out.getvalue(),
-        file_name=final_filename,  # 这里自动命名
-        use_container_width=True
+    file_bytes = out.getvalue()
+    b64 = base64.b64encode(file_bytes).decode("ascii")
+
+    # 自动触发下载，避免二次点击。
+    components.html(
+        f"""
+        <script>
+        (function() {{
+          const b64 = "{b64}";
+          const binary = atob(b64);
+          const bytes = new Uint8Array(binary.length);
+          for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+          const blob = new Blob([bytes], {{ type: 'application/octet-stream' }});
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = "{final_filename}";
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          setTimeout(() => URL.revokeObjectURL(url), 1500);
+        }})();
+        </script>
+        """,
+        height=0,
     )
+
+    # 兜底：极少数浏览器可能拦截自动下载时，仍可手动点击。
+    st.download_button("下载字体", file_bytes, file_name=final_filename, use_container_width=True)
     os.unlink(tmp_path)
