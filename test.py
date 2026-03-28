@@ -264,7 +264,7 @@ with col1:
     # 这里只是显示，不影响最终文件名
     st.text_input("字体名称（自动读取）", value=font_filename_base, disabled=False)
 with col2:
-    size = st.number_input("字号", 8, 128, 24)
+    size = st.number_input("字号", 8, 128, 18)
 with col3:
     letter_spacing = st.number_input("字距", -10, 20, 0)
 with col4:
