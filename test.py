@@ -239,7 +239,7 @@ st.title("Crosspoint 字体转换工具")
 def load_font(path):
     return freetype.Face(path)
 
-uploaded = st.file_uploader("上传 TTF", type=["ttf"])
+uploaded = st.file_uploader("上传 TTF", type=["ttf","otf"])
 tmp_path = None
 font_filename_base = "font"
 
